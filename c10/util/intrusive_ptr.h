@@ -26,7 +26,7 @@ namespace intrusive_ptr {
 inline void incref(intrusive_ptr_target* self);
 }
 
-// constructor tag used by intrusive_ptr constructors
+// 被 intrusive_ptr 构造函数使用的构造函数标签，构造时不增加引用计数
 struct DontIncreaseRefcount {};
 } // namespace raw
 
@@ -37,9 +37,10 @@ constexpr uint64_t kImpracticallyHugeWeakReferenceCount =
 constexpr uint64_t kReferenceCountOne = 1;
 constexpr uint64_t kWeakReferenceCountOne = (kReferenceCountOne << 32);
 constexpr uint64_t kUniqueRef = (kReferenceCountOne | kWeakReferenceCountOne);
-// Indicates whether the object has a PyObject wrapper.
+// 表明对象是否有一个 PyObject 包装器
 constexpr uint64_t kHasPyObject = (uint64_t(1) << 63);
 
+// 指针的空类型，默认为 nullptr
 template <class TTarget>
 struct intrusive_target_default_null_type final {
   static constexpr TTarget* singleton() noexcept {
@@ -72,8 +73,7 @@ inline bool is_uniquely_owned(uint64_t combined_refcount) {
   return (combined_refcount & ~detail::kHasPyObject) == detail::kUniqueRef;
 }
 
-// The only requirement for refcount increment is that it happens-before
-// decrement, so no additional memory ordering is needed.
+// 对引用计数递增的唯一要求是它发生在递减之前，因此不需要额外的内存顺序。
 inline uint64_t atomic_combined_refcount_increment(
     std::atomic<uint64_t>& combined_refcount,
     uint64_t inc) {
@@ -86,15 +86,13 @@ inline uint32_t atomic_weakcount_increment(
       combined_refcount, kWeakReferenceCountOne));
 }
 
-// The requirement is that all modifications to the managed object happen-before
-// invocation of the managed object destructor, and that allocation of the
-// managed object storage happens-before deallocation of the storage.
+// 要求是所有对托管对象的修改都发生在托管对象析构函数调用之前，
+// 并且托管对象存储的分配发生在存储释放之前。
 //
-// To get this ordering, all non-final decrements must synchronize-with the
-// final decrement. So all non-final decrements have to store-release while the
-// final decrement has to load-acquire, either directly or with the help of
-// fences. But it's easiest just to have all decrements be acq-rel. And it turns
-// out, on modern architectures and chips, it's also fastest.
+// 为了获得这种顺序，所有非最终的递减必须与最终的递减同步。
+// 因此，所有非最终的递减必须使用 store-release，而最终的递减必须使用 load-acquire，
+// 要么直接使用，要么借助内存屏障。但最简单的方法是让所有递减都使用 acq-rel。
+// 事实证明，在现代架构和芯片上，这也是最快的。
 inline uint64_t atomic_combined_refcount_decrement(
     std::atomic<uint64_t>& combined_refcount,
     uint64_t dec) {
@@ -107,6 +105,7 @@ inline uint32_t atomic_weakcount_decrement(
       combined_refcount, kWeakReferenceCountOne));
 }
 
+// 判断 T 是否等于 c10::intrusive_ptr_target
 template <class T, class = void>
 struct TargetTraits {
   static constexpr bool can_have_pyobject = false;
@@ -115,84 +114,71 @@ struct TargetTraits {
 } // namespace detail
 
 /**
- * intrusive_ptr<T> is an alternative to shared_ptr<T> that has better
- * performance because it does the refcounting intrusively
- * (i.e. in a member of the object itself).
- * Your class T needs to inherit from intrusive_ptr_target to allow it to be
- * used in an intrusive_ptr<T>. Your class's constructor should not allow
- *`this` to escape to other threads or create an intrusive_ptr from `this`.
+ * intrusive_ptr<T> 是 shared_ptr<T> 的一种替代方案，采用侵入式引用计数，
+ * 你的类 T 需要继承自 intrusive_ptr_target 才能被 intrusive_ptr<T> 使用。
+ * 你的类的构造函数不应该允许 `this` 逃逸到其他线程，也不应该从 `this` 创建 intrusive_ptr。
  */
 
-// Note [Stack allocated intrusive_ptr_target safety]
+// 注意 [栈上分配的 intrusive_ptr_target 的安全性]
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-// A well known problem with std::enable_shared_from_this is that it
-// allows you to create a std::shared_ptr from a stack allocated object,
-// which is totally bogus because the object will die once you return
-// from the stack.  In intrusive_ptr, we can detect that this has occurred,
-// because we set the refcount/weakcount of objects which inherit from
-// intrusive_ptr_target to zero, *unless* we can prove that the object
-// was dynamically allocated (e.g., via make_intrusive).
+// std::enable_shared_from_this 的一个众所周知的问题是，它允许你从栈上分配的对象
+// 创建 std::shared_ptr，这完全是荒谬的，因为一旦从栈返回，该对象就会被销毁。
+// 在 intrusive_ptr 中，我们可以检测到这种情况的发生，因为我们将继承自
+// intrusive_ptr_target 的对象的引用计数/弱引用计数设置为零，*除非* 我们可以证明
+// 该对象是动态分配的（例如，通过 make_intrusive）。
 //
-// Thus, whenever you transmute a T* into a intrusive_ptr<T>, we check
-// and make sure that the refcount isn't zero (or, a more subtle
-// test for weak_intrusive_ptr<T>, for which the refcount may validly
-// be zero, but the weak refcount better not be zero), because that
-// tells us if the object was allocated by us.  If it wasn't, no
-// intrusive_ptr for you!
+// 因此，每当你将 T* 转换为 intrusive_ptr<T> 时，我们会检查并确保引用计数不为零
+// （或者对于 weak_intrusive_ptr<T> 来说，有一个更微妙的测试：引用计数可能有效为零，
+// 但弱引用计数最好不要为零），因为这告诉我们是是否由我们自己分配了该对象。
+// 如果不是，就不能给你 intrusive_ptr！
 
 // NOLINTNEXTLINE(cppcoreguidelines-virtual-class-destructor)
 class C10_API intrusive_ptr_target {
-  // Note [Weak references for intrusive refcounting]
+  // 注意 [侵入式引用计数的弱引用]
   // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  // Here's the scheme:
+  // 方案如下：
   //
-  //  - refcount == number of strong references to the object
-  //    weakcount == number of weak references to the object,
-  //      plus one more if refcount > 0
-  //    An invariant: refcount > 0  =>  weakcount > 0
+  //  - refcount == 指向对象的强引用数量
+  //    weakcount == 指向对象的弱引用数量，
+  //      如果 refcount > 0，则 weakcount 再加一
+  //    不变式：refcount > 0  =>  weakcount > 0
   //
-  //  - c10::StorageImpl stays live as long as there are any strong
-  //    or weak pointers to it (weakcount > 0, since strong
-  //    references count as a +1 to weakcount)
+  //  - 只要有指向 c10::StorageImpl 的强指针或弱指针存在（weakcount > 0，
+  //    因为强引用会使得 weakcount 加一），c10::StorageImpl 就会保持存活
   //
-  //  - finalizers are called and data_ptr is deallocated when refcount == 0
+  //  - 当 refcount == 0 时，会调用终结器，并且 data_ptr 会被释放
   //
-  //  - Once refcount == 0, it can never again be > 0 (the transition
-  //    from > 0 to == 0 is monotonic)
+  //  - 一旦 refcount == 0，就再也不可能 > 0（从 > 0 到 == 0 的转变是单调的）
   //
-  //  - When you access c10::StorageImpl via a weak pointer, you must
-  //    atomically increment the use count, if it is greater than 0.
-  //    If it is not, you must report that the storage is dead.
+  //  - 当你通过弱指针访问 c10::StorageImpl 时，如果引用计数大于 0，
+  //    你必须原子地增加使用计数。如果它不大于 0，你必须报告该存储已经死亡。
   //
-  //.We use a single combined count for refcount and weakcount so that
-  // we can atomically operate on both at the same time for performance
-  // and defined behaviors.
-  //
-  // Note [PyObject preservation for Tensor and Storages]
+  // 我们使用一个组合计数来同时表示 refcount 和 weakcount，
+  // 这样我们就可以原子地同时操作两者，以获得更好的性能和确定的行为。
+
+  // combined_refcount_ 格式：低 32 位是 refcount，33-63 位是 weakcount，最高位是 PyObject 标识
+  // 注意 [Tensor 和 Storage 的 PyObject 保留]
   // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  // intrusive_ptr has special support for preserving PyObject wrappers
-  // for TensorImpl and StorageImpl. The most significant bit (kHasPyObject) of
-  // the combined_refcount_ is used to indicate whether the object has a
-  // PyObject wrapper.
+  // intrusive_ptr 对 TensorImpl 和 StorageImpl 的 PyObject 包装器提供了特殊支持。
+  // 组合引用计数 combined_refcount_ 的最高有效位（kHasPyObject）用于指示该对象是否拥有 PyObject 包装器。
   //
-  //   - The PyObject, if it exists, holds a strong reference to the
-  //     intrusive_ptr_target.
+  //   - 如果 PyObject 存在，它将持有一个对 intrusive_ptr_target 的强引用。
   //
-  //   - When the refcount goes from 1 to 2, we incref the PyObject.
+  //   - 当 refcount 从 1 变为 2 时，我们会增加 PyObject 的引用计数（incref）。
   //
-  //   - When the refcount goes from 2 to 1, we decref the PyObject.
+  //   - 当 refcount 从 2 变为 1 时，我们会减少 PyObject 的引用计数（decref）。
   //
-  // In other words, the intrusive_ptr keeps the PyObject alive as long as there
-  // are other C++ references to the intrusive_ptr_target.
+  // 换句话说，只要存在其他指向 intrusive_ptr_target 的 C++ 引用，
+  // intrusive_ptr 就会保持 PyObject 存活。
 
   mutable std::atomic<uint64_t> combined_refcount_;
   static_assert(sizeof(std::atomic<uint64_t>) == 8);
   static_assert(alignof(std::atomic<uint64_t>) == 8);
-  // is_always_lock_free check lives in intrusive_ptr.cpp so it's only
-  // evaluated by the host compiler. CUDA-like device compilers parsing this
-  // header may target hardware without 64-bit atomics; see
-  // https://github.com/pytorch/pytorch/issues/171775 (introduced by
-  // https://github.com/pytorch/pytorch/pull/163394).
+  // is_always_lock_free 的检查位于 intrusive_ptr.cpp 中，因此它只由
+  // 主机编译器进行评估。类似 CUDA 的设备编译器在解析此头文件时可能会
+  // 针对没有 64 位原子操作的硬件进行编译；请参见
+  // https://github.com/pytorch/pytorch/issues/171775（由
+  // https://github.com/pytorch/pytorch/pull/163394 引入）。
 
   template <typename T, typename NullType>
   friend class intrusive_ptr;
@@ -209,59 +195,14 @@ class C10_API intrusive_ptr_target {
   friend class torch::utils::PyObjectPreservation;
 
  protected:
-  // protected destructor. We never want to destruct intrusive_ptr_target*
-  // directly.
-  virtual ~intrusive_ptr_target() {
-// Disable -Wterminate and -Wexceptions so we're allowed to use assertions
-// (i.e. throw exceptions) in a destructor.
-// We also have to disable -Wunknown-warning-option and -Wpragmas, because
-// some other compilers don't know about -Wterminate or -Wexceptions and
-// will show a warning about unknown warning options otherwise.
-#if defined(_MSC_VER) && !defined(__clang__)
-#pragma warning(push)
-#pragma warning( \
-    disable : 4297) // function assumed not to throw an exception but does
-#else
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpragmas"
-#pragma GCC diagnostic ignored "-Wunknown-warning-option"
-#pragma GCC diagnostic ignored "-Wterminate"
-#pragma GCC diagnostic ignored "-Wexceptions"
-#endif
-    TORCH_INTERNAL_ASSERT_DEBUG_ONLY(
-        // Second condition is there to accommodate
-        // unsafe_adapt_non_heap_allocated: since we are doing our own
-        // deallocation in that case, it is correct for each
-        // expected_decref to have happened (some user code tried to
-        // decref and thus free the object, but it didn't happen right
-        // away) or not (no user code tried to free the object, and
-        // now it's getting destroyed through whatever mechanism the
-        // caller of unsafe_adapt_non_heap_allocated wanted to
-        // use). We choose our reference count such that the count
-        // will not dip below kImpracticallyHugeReferenceCount regardless.
-        refcount() == 0 ||
-            refcount() >= detail::kImpracticallyHugeReferenceCount,
-        "Tried to destruct an intrusive_ptr_target that still has intrusive_ptr to it; refcount was ",
-        refcount());
-    TORCH_INTERNAL_ASSERT_DEBUG_ONLY(
-        // See ~intrusive_ptr for optimization that will frequently result in 1
-        // at destruction time.
-        weakcount() == 1 || weakcount() == 0 ||
-            weakcount() == detail::kImpracticallyHugeReferenceCount - 1 ||
-            weakcount() == detail::kImpracticallyHugeReferenceCount,
-        "Tried to destruct an intrusive_ptr_target that still has weak_intrusive_ptr to it");
-#if defined(_MSC_VER) && !defined(__clang__)
-#pragma warning(pop)
-#else
-#pragma GCC diagnostic pop
-#endif
-  }
+  // protected 析构函数。我们永远不希望直接析构 intrusive_ptr_target*。
+  virtual ~intrusive_ptr_target() {}
 
   constexpr intrusive_ptr_target() noexcept : combined_refcount_(0) {}
 
-  // intrusive_ptr_target supports copy and move: but refcount and weakcount
-  // don't participate (since they are intrinsic properties of the memory
-  // location)
+  // intrusive_ptr_target 支持 copy 和 move：但 refcount 和 weakcount 不参与
+  // （因为它们是 memory location 的内在属性）
+  // 所以赋值和移动构造也等同于默认构造，不会真的赋值
   intrusive_ptr_target(intrusive_ptr_target&& /*other*/) noexcept
       : intrusive_ptr_target() {}
 
@@ -279,21 +220,20 @@ class C10_API intrusive_ptr_target {
 
  private:
   /**
-   * This is called when refcount reaches zero.
-   * You can override this to release expensive resources.
-   * There might still be weak references, so your object might not get
-   * destructed yet, but you can assume the object isn't used anymore,
-   * i.e. no more calls to methods or accesses to members (we just can't
-   * destruct it yet because we need the weakcount accessible).
+   * 当 refcount 变为零时调用此函数。
+   * 你可以重写此函数来释放昂贵的资源。
+   * 此时可能仍然存在 weak references，因此你的对象可能尚未被析构，
+   * 但你可以假定该对象不再被使用，即不会再调用其方法或访问其成员
+   * （我们之所以还不能析构它，是因为需要保证 weakcount 可访问）。
    *
-   * If there are no weak references (i.e. your class is about to be
-   * destructed), this function WILL NOT be called.
+   * 如果不存在 weak references（即你的对象即将被析构），
+   * 则不会调用此函数。
    */
   virtual void release_resources() {}
 
   /**
-   * These two methods are called when the refcount transitions between one
-   * and two and the object has a PyObject wrapper.
+   * 当 refcount 在 1 和 2 之间转换并且对象有 PyObject wrapper 时，
+   * 会调用这两个方法。
    */
   virtual void incref_pyobject() const noexcept {}
   virtual void decref_pyobject() const noexcept {}
@@ -301,6 +241,7 @@ class C10_API intrusive_ptr_target {
     return false;
   }
 
+  // 这里的封装将数据转换成 uint32_t，并处理最高有效位（kHasPyObject）
   uint32_t refcount(std::memory_order order = std::memory_order_relaxed) const {
     return detail::refcount(combined_refcount_.load(order));
   }
@@ -316,8 +257,6 @@ namespace detail {
 #ifndef C10_MOBILE
 template <>
 struct TargetTraits<c10::intrusive_ptr_target> {
-  // A generic intrusive_ptr<intrusive_ptr_target> may actually be a TensorImpl
-  // or StorageImpl, so we have to allow for PyObject support.
   static constexpr bool can_have_pyobject = true;
 };
 #endif
@@ -332,13 +271,6 @@ template <
     class NullType = detail::intrusive_target_default_null_type<TTarget>>
 class intrusive_ptr final {
  private:
-//  the following static assert would be nice to have but it requires
-//  the target class T to be fully defined when intrusive_ptr<T> is instantiated
-//  this is a problem for classes that contain pointers to themselves
-//  static_assert(
-//      std::is_base_of_v<intrusive_ptr_target, TTarget>,
-//      "intrusive_ptr can only be used for classes that inherit from
-//      intrusive_ptr_target.");
 #ifndef _WIN32
   // This static_assert triggers on MSVC
   //  error C2131: expression did not evaluate to a constant
@@ -361,12 +293,10 @@ class intrusive_ptr final {
   friend class intrusive_ptr;
   friend class weak_intrusive_ptr<TTarget, NullType>;
 
-  // Make pybind11::class_ be a friend class of intrusive_ptr, so that custom
-  // smart holder in pybind11 could access the private constructor of
-  // intrusive_ptr(T*) which took the ownership of the object. This is required
-  // by customer holder macro PYBIND11_DECLARE_HOLDER_TYPE, where it uses
-  // intrusive_ptr(TTarget*) to initialize and take ownership of the object. For
-  // details, see
+  // 让 pybind11::class_ 成为 intrusive_ptr 的 friend class，这样 pybind11 中的 custom smart holder
+  // 就能够访问 intrusive_ptr(T*) 的私有构造函数，该构造函数接管了对象的所有权。
+  // 这是 custom holder macro PYBIND11_DECLARE_HOLDER_TYPE 所要求的，该 macro 使用
+  // intrusive_ptr(TTarget*) 来初始化并接管对象的所有权。有关详细信息，请参见
   // https://pybind11.readthedocs.io/en/stable/advanced/smart_ptrs.html#custom-smart-pointers
   template <typename, typename...>
   friend class pybind11::class_;
@@ -381,10 +311,9 @@ class intrusive_ptr final {
           "intrusive_ptr: Cannot increase refcount after it reached zero.");
 
       if constexpr (detail::TargetTraits<TTarget>::can_have_pyobject) {
-        // If the refcount transitioned from 1 to 2, we need to incref the
-        // PyObject. In other words, we need to ensure that the PyObject stays
-        // alive now that we have a C++ reference to this object in addition to
-        // the PyObject itself.
+        // 如果 refcount 从 1 转变为 2，我们需要 incref 该 PyObject。换句话说，
+        // 我们需要确保 PyObject 保持存活，因为现在我们除了 PyObject 本身之外，
+        // 还有一个指向此对象的 C++ reference。
         if (detail::has_pyobject(combined) && detail::refcount(combined) == 2) {
           target_->incref_pyobject();
         }
@@ -402,15 +331,12 @@ class intrusive_ptr final {
     }
   }
 
-  // C10_NOINLINE to keep binary size a bit smaller. We pass TTarget* here
-  // to avoid an extra pointer dereference in the call from reset_().
+  // C10_NOINLINE 以保持二进制体积稍小。我们在这里传递 TTarget* 以避免在 reset_() 调用中额外的指针解引用。
   C10_NOINLINE static void reset_not_null_(TTarget* target) noexcept {
     if (detail::is_uniquely_owned(
             target->combined_refcount_.load(std::memory_order_acquire))) {
-      // Both counts are 1, so there are no weak references and
-      // we are releasing the last strong reference. No other
-      // threads can observe the effects of this target deletion
-      // call (e.g. calling use_count()) without a data race.
+      // 两个计数都是 1，因此没有弱引用，并且我们正在释放最后一个强引用。
+      // 没有其他线程能够无数据竞争地观察到该目标删除调用的效果（例如调用 use_count()）。
       target->combined_refcount_.store(0, std::memory_order_relaxed);
       delete target;
       return;
@@ -425,15 +351,13 @@ class intrusive_ptr final {
         delete target;
         return;
       }
-      // See comment above about weakcount. As long as refcount>0,
-      // weakcount is one larger than the actual number of weak references.
-      // So we need to decrement it here.
+      // 参见上面关于 weakcount 的注释。
+      // 只要 refcount>0，weakcount 就比实际弱引用数大 1。因此我们需要在此递减它。
       release_resources_and_decrement_weakrefs_(target);
     } else if constexpr (detail::TargetTraits<TTarget>::can_have_pyobject) {
-      // If the refcount transitioned from 2 to 1, we need to decref the
-      // PyObject. In other words, we don't want to keep the PyObject alive if
-      // there are no C++ references to this object other than the PyObject
-      // itself.
+      // 如果 refcount 从 2 变为 1，我们需要减少 PyObject 的引用计数。
+      // 换句话说，如果除了 PyObject 本身之外没有其他 C++ 引用指向此对象，
+      // 我们不想让 PyObject 保持存活。
       if (has_pyobject && new_refcount == 1) {
         target->decref_pyobject();
       }
@@ -446,32 +370,28 @@ class intrusive_ptr final {
 
   C10_NOINLINE static void release_resources_and_decrement_weakrefs_(
       TTarget* target) noexcept {
-    // justification for const_cast: release_resources is basically a
-    // destructor and a destructor always mutates the object, even for
-    // const objects.
+    // const_cast 的理由：release_resources 基本上是一个析构函数，
+    // 而析构函数总会修改对象，即使是 const 对象也是如此。
     const_cast<std::remove_const_t<TTarget>*>(target)->release_resources();
     if (detail::atomic_weakcount_decrement(target->combined_refcount_) == 0) {
       delete target;
     }
   }
 
-  // raw pointer constructors are not public because we shouldn't make
-  // intrusive_ptr out of raw pointers except from inside the make_intrusive(),
-  // reclaim() and weak_intrusive_ptr::lock() implementations.
+  // 原始指针构造函数不是公开的，因为除了在 make_intrusive()、reclaim() 
+  // 和 weak_intrusive_ptr::lock() 的实现内部之外，我们不应该通过原始指针构造 intrusive_ptr。
 
-  // This constructor will increase the ref counter for you.
-  // This constructor will be used by the make_intrusive(), and also pybind11,
-  // which wrap the intrusive_ptr holder around the raw pointer and incref
-  // correspondingly (pybind11 requires raw pointer constructor to incref by
-  // default).
+  // 此构造函数会为你增加引用计数。
+  // 此构造函数将被 make_intrusive() 以及 pybind11 使用，
+  // 后者将 intrusive_ptr 持有者包裹在原始指针周围
+  // 并相应地进行 incref（pybind11 默认要求原始指针构造函数进行 incref）。
   explicit intrusive_ptr(TTarget* target)
       : intrusive_ptr(target, raw::DontIncreaseRefcount{}) {
     if (target_ != NullType::singleton()) {
-      // We just created result.target_, so we know no other thread has
-      // access to it, so we know we needn't care about memory ordering.
-      // (On x86_64, a store with memory_order_relaxed generates a plain old
-      // `mov`, whereas an atomic increment does a lock-prefixed `add`, which is
-      // much more expensive: https://godbolt.org/z/eKPzj8.)
+      // 我们刚刚创建了 result.target_，因此我们知道没有其他线程可以访问它，
+      // 所以我们知道不必关心内存顺序。
+      // （在 x86_64 上，使用 memory_order_relaxed 的存储会生成普通的 `mov`，
+      // 而原子增量会生成 lock 前缀的 `add`，后者昂贵得多：https://godbolt.org/z/eKPzj8。）
       TORCH_INTERNAL_ASSERT_DEBUG_ONLY(
           target_->combined_refcount_.load(std::memory_order_relaxed) == 0,
           "intrusive_ptr: Newly-created target had non-zero refcounts. Does its "
@@ -491,9 +411,8 @@ class intrusive_ptr final {
   /* implicit */ intrusive_ptr(std::nullptr_t) noexcept
       : intrusive_ptr(NullType::singleton(), raw::DontIncreaseRefcount{}) {}
 
-  // This constructor will not increase the ref counter for you.
-  // We use the tagged dispatch mechanism to explicitly mark this constructor
-  // to not increase the refcount
+  // 此构造函数不会为你增加 ref counter。
+  // 我们使用 tagged dispatch 机制来显式标记此构造函数不增加 refcount。
   explicit intrusive_ptr(
       TTarget* target,
       raw::DontIncreaseRefcount /*unused*/) noexcept
@@ -550,8 +469,7 @@ class intrusive_ptr final {
     return *this;
   }
 
-  // Assignment is implemented using copy and swap. That's safe for self
-  // assignment.
+  // 赋值通过拷贝和交换来实现
   // NOLINTNEXTLINE(bugprone-unhandled-self-assignment)
   intrusive_ptr& operator=(const intrusive_ptr& rhs) & noexcept {
     // NOLINTNEXTLINE(*assign-operator, *assignment-signature)
@@ -594,7 +512,7 @@ class intrusive_ptr final {
     std::swap(target_, rhs.target_);
   }
 
-  // We do a lot of null-pointer checks in our code, good to have this be cheap.
+  // 我们在代码中做了很多空指针检查，让这个操作廉价是件好事。
   bool defined() const noexcept {
     return target_ != NullType::singleton();
   }
@@ -613,12 +531,13 @@ class intrusive_ptr final {
     return target_->weakcount(std::memory_order_relaxed);
   }
 
+  // 只关心强引用是否为 1
   bool unique() const noexcept {
     return use_count() == 1;
   }
 
   /**
-   * Stronger than unique() in that it must not have any weakrefs as well.
+   * // 比 unique() 更强，因为它也必须没有任何弱引用。
    */
   bool is_uniquely_owned() const noexcept {
     TORCH_INTERNAL_ASSERT_DEBUG_ONLY(target_ != NullType::singleton());
@@ -627,11 +546,10 @@ class intrusive_ptr final {
   }
 
   /**
-   * Returns an owning (!) pointer to the underlying object and makes the
-   * intrusive_ptr instance invalid. That means the refcount is not decreased.
-   * You *must* put the returned pointer back into a intrusive_ptr using
-   * intrusive_ptr::reclaim(ptr) to properly destruct it.
-   * This is helpful for C APIs.
+   * 返回指向底层对象的所有权指针，并使 intrusive_ptr 实例失效。
+   * 这意味着引用计数不会减少。
+   * 你*必须*将返回的指针通过 intrusive_ptr::reclaim(ptr) 重新放回 intrusive_ptr 中以正确析构它。
+   * 这对 C API 很有帮助。
    */
   TTarget* release() noexcept {
     // NOLINTNEXTLINE(clang-analyzer-core.uninitialized.Assign)
@@ -641,10 +559,9 @@ class intrusive_ptr final {
   }
 
   /**
-   * Takes an owning pointer to TTarget* and creates an intrusive_ptr that takes
-   * over ownership. That means the refcount is not increased.
-   * This is the counter-part to intrusive_ptr::release() and the pointer
-   * passed in *must* have been created using intrusive_ptr::release().
+   * 接受一个指向 TTarget* 的所有权指针，并创建一个接管所有权的 intrusive_ptr。
+   * 这意味着引用计数不会增加。
+   * 这是 intrusive_ptr::release() 的对应方法，传入的指针*必须*是通过 intrusive_ptr::release() 创建的。
    */
   static intrusive_ptr reclaim(TTarget* owning_ptr) {
     TORCH_INTERNAL_ASSERT_DEBUG_ONLY(
@@ -655,9 +572,8 @@ class intrusive_ptr final {
   }
 
   /**
-   * Takes an owning pointer to TTarget* and creates an intrusive_ptr
-   * representing a new reference, i.e. the raw pointer retains
-   * ownership.
+   * 接受一个指向 TTarget* 的所有权指针，并创建一个表示新引用的 intrusive_ptr，
+   * 即原始指针保留所有权。
    */
   static intrusive_ptr reclaim_copy(TTarget* owning_ptr) {
     auto ret = reclaim(owning_ptr);
@@ -666,9 +582,8 @@ class intrusive_ptr final {
   }
 
   /**
-   * Allocate a heap object with args and wrap it inside a intrusive_ptr and
-   * incref. This is a helper function to let make_intrusive() access private
-   * intrusive_ptr constructors.
+   * 在堆上分配一个对象，使用参数构造它，并将其包装在 intrusive_ptr 中并增加引用计数。
+   * 这是一个辅助函数，用于让 make_intrusive() 访问私有的 intrusive_ptr 构造函数。
    */
   template <class... Args>
   static intrusive_ptr make(Args&&... args) {
@@ -676,47 +591,33 @@ class intrusive_ptr final {
   }
 
   /**
-   * Turn a new instance of TTarget (e.g., literally allocated
-   * using new TTarget(...) into an intrusive_ptr.  If possible,
-   * use intrusive_ptr::make instead which statically guarantees
-   * that the allocation was done properly.
+   * 将一个 TTarget 的新实例（例如，使用 new TTarget(...) 分配的对象）转换为 intrusive_ptr。
+   * 如果可能，请使用 intrusive_ptr::make，它能在静态层面保证分配正确完成。
    *
-   * At the moment, the only reason this method exists is because
-   * pybind11 holder types expect to be able to allocate in
-   * this way (because pybind11 handles the new allocation itself).
+   * 目前，此方法存在的唯一原因是 pybind11 的持有者类型期望能够以这种方式进行分配（因为 pybind11 自己处理 new 分配）。
    */
   static intrusive_ptr unsafe_steal_from_new(TTarget* raw_ptr) {
     return intrusive_ptr(raw_ptr);
   }
 
   /**
-   * Turn an instance of TTarget that should not be reference counted
-   * (e.g., allocated into an arena with placement new) into an
-   * intrusive_ptr. This is gratuitously unsafe and should only be
-   * used if you can guarantee that the pointer will not escape and be
-   * refcounted as normal.
+   * 将一个不应进行引用计数（例如，通过 placement new 在 arena 中分配）的 TTarget 实例转换为 intrusive_ptr。
+   * 这是完全不安全的，仅在你能够保证该指针不会逃逸并被正常引用计数时才能使用。
    *
-   * `expected_decrefs` is a debugging parameter: it indicates the
-   * number of strong owners the intrusive_ptr_target in question is
-   * expected to get. In most use cases, this will likely be 1.
+   * `expected_decrefs` 是一个调试参数：它指示所涉及的 intrusive_ptr_target 预期的强所有者数量。
+   * 在大多数用例中，这很可能是 1。
    *
-   * The reason this method exists is for manually sharing
-   * StorageImpls across Tensors in the static runtime. It needs
-   * access to private intrusive_ptr members so that the refcounts can
-   * be initialized to custom values.
+   * 此方法存在的理由是在静态运行时中手动跨 Tensor 共享 StorageImpl。
+   * 它需要访问私有的 intrusive_ptr 成员，以便将引用计数初始化为自定义值。
    */
   static intrusive_ptr unsafe_adapt_non_heap_allocated(
       TTarget* raw_ptr,
       uint32_t expected_decrefs) {
     intrusive_ptr result(raw_ptr, raw::DontIncreaseRefcount{});
-    // kImpracticallyHugeReferenceCount is impractically huge for a reference
-    // count, while being in no danger of overflowing uint32_t. We actually only
-    // need to initialize the refcount to 2 -- we are just doing an unbalanced
-    // incref to prevent the non-heap-allocated target from being
-    // freed, and we are optimizing that incref by directly
-    // initializing the refcounts rather than doing an expensive
-    // atomic increment. The reason to use kImpracticallyHugeReferenceCount is
-    // to accommodate the debug assertions in ~intrusive_ptr_target.
+    // kImpracticallyHugeReferenceCount 对于引用计数来说是不切实际的大，但同时不会溢出 uint32_t。
+    // 我们实际上只需要将引用计数初始化为 2 —— 我们只是进行一个不平衡的 incref 以防止非堆分配的目标被释放，
+    // 并且我们通过直接初始化引用计数而不是进行昂贵的原子增量来优化这个 incref。
+    // 使用 kImpracticallyHugeReferenceCount 的原因是为了适应 ~intrusive_ptr_target 中的调试断言。
 #ifdef NDEBUG
     expected_decrefs = 0;
 #endif
@@ -729,12 +630,11 @@ class intrusive_ptr final {
   }
 
   /**
-   * Turn a **non-owning raw pointer** to an intrusive_ptr.  It is
-   * the moral equivalent of enable_shared_from_this on a shared pointer.
+   * 将一个**非所有权的原始指针**转换为 intrusive_ptr。
+   * 它在道德上等同于 shared_ptr 上的 enable_shared_from_this。
    *
-   * This method is only valid for objects that are already live.  If
-   * you are looking for the moral equivalent of unique_ptr<T>(T*)
-   * constructor, see steal_from_new.
+   * 此方法仅对已经存活的对象有效。
+   * 如果你在寻找 unique_ptr<T>(T*) 构造函数的道德等价物，请参见 steal_from_new。
    *
    * TODO: https://github.com/pytorch/pytorch/issues/56482
    */
@@ -749,6 +649,7 @@ class intrusive_ptr final {
   }
 };
 
+// 构建 intrusive_ptr
 template <
     class TTarget,
     class NullType = detail::intrusive_target_default_null_type<TTarget>,
@@ -757,6 +658,7 @@ inline intrusive_ptr<TTarget, NullType> make_intrusive(Args&&... args) {
   return intrusive_ptr<TTarget, NullType>::make(std::forward<Args>(args)...);
 }
 
+// 交换两个 intrusive_ptr
 template <class TTarget, class NullType>
 inline void swap(
     intrusive_ptr<TTarget, NullType>& lhs,
@@ -764,7 +666,7 @@ inline void swap(
   lhs.swap(rhs);
 }
 
-// To allow intrusive_ptr inside std::map or std::set, we need operator<
+// 为了允许 intrusive_ptr 在 std::map 或 std::set 里，我们需要重载运算符 < 和 =
 template <class TTarget1, class NullType1, class TTarget2, class NullType2>
 inline bool operator<(
     const intrusive_ptr<TTarget1, NullType1>& lhs,
@@ -813,6 +715,8 @@ inline bool operator!=(
     const intrusive_ptr<TTarget2, NullType2>& rhs) noexcept {
   return !operator==(nullptr, rhs);
 }
+
+// 定义零成本借用语义
 template <typename T>
 struct MaybeOwnedTraits<c10::intrusive_ptr<T>> {
   using owned_type = c10::intrusive_ptr<T>;
@@ -855,8 +759,6 @@ class weak_intrusive_ptr final {
       std::is_base_of_v<intrusive_ptr_target, TTarget>,
       "intrusive_ptr can only be used for classes that inherit from intrusive_ptr_target.");
 #ifndef _WIN32
-  // This static_assert triggers on MSVC
-  //  error C2131: expression did not evaluate to a constant
   static_assert(
       NullType::singleton() == NullType::singleton(),
       "NullType must have a constexpr singleton() method");
@@ -988,27 +890,21 @@ class weak_intrusive_ptr final {
     rhs.target_ = tmp;
   }
 
-  // NB: This should ONLY be used by the std::hash implementation
-  // for weak_intrusive_ptr.  Another way you could do this is
-  // friend std::hash<weak_intrusive_ptr>, but this triggers two
-  // bugs:
+  // 注意：这应该 ONLY 被 weak_intrusive_ptr 的 std::hash 实现使用。
+  // 另一种做法是将 friend std::hash<weak_intrusive_ptr> 声明为友元，但这会触发两个 bug：
   //
-  //  (1) It triggers an nvcc bug, where std::hash in a friend class
-  //      declaration gets preprocessed into hash, which then cannot
-  //      actually be found.  The error in this case looks like:
+  //  (1) 它会触发一个 nvcc 的 bug，在友元类声明中的 std::hash 会被预处理为 hash，
+  //      然后实际上无法找到。这个错误的报错信息类似于：
   //
   //        error: no template named 'hash'; did you mean 'std::hash'?
   //
-  //  (2) On OS X, std::hash is declared as a struct, not a class.
-  //      This twings:
+  //  (2) 在 OS X 上，std::hash 被声明为 struct，而不是 class。这会触发：
   //
   //        error: class 'hash' was previously declared as a struct
   //        [-Werror,-Wmismatched-tags]
   //
-  // Both of these are work-aroundable, but on the whole, I decided
-  // it would be simpler and easier to make work if we just expose
-  // an unsafe getter for target_
-  //
+  // 这两个问题都可以被解决，但总的来说，我觉得如果我们只是暴露一个
+  // 用于获取 target_ 的不安全 getter，会更简单、更容易使其工作。
   TTarget* _unsafe_get_target() const noexcept {
     return target_;
   }
@@ -1032,6 +928,7 @@ class weak_intrusive_ptr final {
     return use_count() == 0;
   }
 
+  // 从 weak_intrusive_ptr 安全地升级为 intrusive_ptr
   intrusive_ptr<TTarget, NullType> lock() const noexcept {
     if (target_ == NullType::singleton()) {
       return intrusive_ptr<TTarget, NullType>();
@@ -1041,29 +938,30 @@ class weak_intrusive_ptr final {
           target_->combined_refcount_.load(std::memory_order_relaxed);
       do {
         if (detail::refcount(combined_refcount) == 0) {
-          // Object already destructed, no strong references left anymore.
-          // Return nullptr.
+          // 对象已经被销毁，返回 nullptr
           return intrusive_ptr<TTarget, NullType>();
         }
         if constexpr (detail::TargetTraits<TTarget>::can_have_pyobject) {
           if (detail::has_pyobject(combined_refcount) &&
               detail::refcount(combined_refcount) == 1 && !increfed) {
-            // Object has a python wrapper with no other C++ references.
-            // We need to to incref the Python object before we acquire a
-            // strong reference to the C++ object to avoid a situation
-            // where the Python object is deallocated concurrently.
+            // 对象有一个 Python 包装器，并且没有其他 C++ 引用。
+            // 我们需要在获取 C++ 对象的强引用之前增加 Python 对象的引用计数，
+            // 以避免出现 Python 对象被并发释放的情况。
             if (!target_->try_incref_pyobject()) {
               return intrusive_ptr<TTarget, NullType>();
             }
             increfed = true;
           }
         }
+        // 成功时计数+1，必须确保能看到之前其他线程在释放引用计数（release）
+        // 失败时重试，不涉及同步数据，直接 relaxed
       } while (!target_->combined_refcount_.compare_exchange_weak(
           combined_refcount,
           combined_refcount + detail::kReferenceCountOne,
           std::memory_order_acquire,
           std::memory_order_relaxed));
 
+      // 由于前面多加了一次 python 计数，所以这里要减回来
       if constexpr (detail::TargetTraits<TTarget>::can_have_pyobject) {
         if (increfed && detail::refcount(combined_refcount) != 1) {
           target_->decref_pyobject();
@@ -1076,12 +974,10 @@ class weak_intrusive_ptr final {
   }
 
   /**
-   * Returns an owning (but still only weakly referenced) pointer to the
-   * underlying object and makes the weak_intrusive_ptr instance invalid.
-   * That means the weakcount is not decreased.
-   * You *must* put the returned pointer back into a weak_intrusive_ptr using
-   * weak_intrusive_ptr::reclaim(ptr) to properly destruct it.
-   * This is helpful for C APIs.
+   * 返回指向底层对象的所有权（但仍然是弱引用）指针，并使 weak_intrusive_ptr 实例失效。
+   * 这意味着弱引用计数不会减少。
+   * 你*必须*将返回的指针通过 weak_intrusive_ptr::reclaim(ptr) 重新放回 weak_intrusive_ptr 中以正确析构它。
+   * 这对 C API 很有帮助。
    */
   TTarget* release() noexcept {
     TTarget* result = target_;
@@ -1090,17 +986,15 @@ class weak_intrusive_ptr final {
   }
 
   /**
-   * Takes an owning (but must be weakly referenced) pointer to TTarget* and
-   * creates a weak_intrusive_ptr that takes over ownership.
-   * This means that the weakcount is not increased.
-   * This is the counter-part to weak_intrusive_ptr::release() and the pointer
-   * passed in *must* have been created using weak_intrusive_ptr::release().
+   * 接受一个所有权（但必须是弱引用的）指向 TTarget* 的指针，并创建一个接管所有权的 weak_intrusive_ptr。
+   * 这意味着弱引用计数不会增加。
+   * 这是 weak_intrusive_ptr::release() 的对应方法，传入的指针*必须*是通过 weak_intrusive_ptr::release() 创建的。
    */
   static weak_intrusive_ptr reclaim(TTarget* owning_weak_ptr) {
-    // See Note [Stack allocated intrusive_ptr_target safety]
-    // if refcount > 0, weakcount must be >1 for weak references to exist.
-    // see weak counting explanation at top of this file.
-    // if refcount == 0, weakcount only must be >0.
+    // 参见注释 [栈上分配的 intrusive_ptr_target 安全性]
+    // 如果 refcount > 0，则 weakcount 必须 >1 才能存在弱引用。
+    // 参见本文件开头的弱计数解释。
+    // 如果 refcount == 0，则 weakcount 必须 >0。
     TORCH_INTERNAL_ASSERT_DEBUG_ONLY(
         owning_weak_ptr == NullType::singleton() ||
             owning_weak_ptr->weakcount() > 1 ||
@@ -1111,9 +1005,8 @@ class weak_intrusive_ptr final {
   }
 
   /**
-   * Takes a pointer to TTarget* (may be weak or strong) and creates a
-   * new weak_intrusive_ptr representing a new weak reference, i.e.
-   * the raw pointer retains ownership.
+   * 接受一个指向 TTarget* 的指针（可能是弱引用或强引用），并创建一个表示新弱引用的新 weak_intrusive_ptr，
+   * 即原始指针保留所有权。
    */
   static weak_intrusive_ptr reclaim_copy(TTarget* owning_ptr) {
     auto ret = reclaim(owning_ptr);
@@ -1160,28 +1053,15 @@ inline bool operator!=(
   return !operator==(lhs, rhs);
 }
 
-// Alias for documentary purposes, to more easily distinguish
-// weak raw intrusive pointers from intrusive pointers.
+// 为了文档目的而起的别名，以便更容易区分弱原始 intrusive 指针和 intrusive 指针。
 using weak_intrusive_ptr_target = intrusive_ptr_target;
 
-// This namespace provides some methods for working with
-// raw pointers that subclass intrusive_ptr_target.  They are not provided
-// as methods on intrusive_ptr_target, because ideally you would not need these
-// methods at all (use smart pointers), but if you are dealing with legacy code
-// that still needs to pass around raw pointers, you may find these quite
-// useful.
-//
-// An important usage note: some functions are only valid if you have a
-// strong raw pointer to the object, while others are only valid if you
-// have a weak raw pointer to the object.  ONLY call intrusive_ptr namespace
-// functions on strong pointers, and weak_intrusive_ptr namespace functions
-// on weak pointers.  If you mix it up, you may get an assert failure.
+// 此命名空间提供了一些方法来处理继承自 intrusive_ptr_target 的原始指针
+// 正常不会用到，不必理会
 namespace raw {
 
 namespace intrusive_ptr {
 
-// WARNING: Unlike the reclaim() API, it is NOT valid to pass
-// NullType::singleton to this function
 inline void incref(intrusive_ptr_target* self) {
   if (self) {
     uint64_t combined = detail::atomic_combined_refcount_increment(
@@ -1197,18 +1077,12 @@ inline void incref(intrusive_ptr_target* self) {
   }
 }
 
-// WARNING: Unlike the reclaim() API, it is NOT valid to pass
-// NullType::singleton to this function
 inline void decref(intrusive_ptr_target* self) {
-  // Let it die
   c10::intrusive_ptr<intrusive_ptr_target>::reclaim(self);
-  // NB: Caller still has 'self' pointer, but it's now invalid.
-  // If you want more safety, used the actual c10::intrusive_ptr class
 }
 
 template <typename T>
 inline T* make_weak(T* self) {
-  // NB: 'this' is a strong pointer, but we return a weak pointer
   auto ptr = c10::intrusive_ptr<T>::reclaim(self);
   c10::weak_intrusive_ptr<T> wptr(ptr);
   ptr.release();
@@ -1231,10 +1105,7 @@ inline void incref(weak_intrusive_ptr_target* self) {
 }
 
 inline void decref(weak_intrusive_ptr_target* self) {
-  // Let it die
   c10::weak_intrusive_ptr<intrusive_ptr_target>::reclaim(self);
-  // NB: You still "have" the 'self' pointer, but it's now invalid.
-  // If you want more safety, used the actual c10::weak_intrusive_ptr class
 }
 
 template <typename T>
@@ -1245,7 +1116,6 @@ inline T* lock(T* self) {
   return ptr.release();
 }
 
-// This gives the STRONG refcount of a WEAK pointer
 inline uint32_t use_count(weak_intrusive_ptr_target* self) {
   auto wptr = c10::weak_intrusive_ptr<intrusive_ptr_target>::reclaim(self);
   auto r = wptr.use_count();
@@ -1260,8 +1130,7 @@ inline uint32_t use_count(weak_intrusive_ptr_target* self) {
 } // namespace c10
 
 namespace std {
-// To allow intrusive_ptr and weak_intrusive_ptr inside std::unordered_map or
-// std::unordered_set, we need std::hash
+// 为了在 std::unordered_map 或 std::unordered_set 中使用 intrusive_ptr 和 weak_intrusive_ptr，我们需要 std::hash
 template <class TTarget, class NullType>
 struct hash<c10::intrusive_ptr<TTarget, NullType>> {
   size_t operator()(const c10::intrusive_ptr<TTarget, NullType>& x) const {
