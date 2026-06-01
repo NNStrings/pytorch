@@ -8,59 +8,59 @@
 #include <utility>
 
 namespace c10 {
-
-/// MaybeOwnedTraits<T> describes how to borrow from T.  Here is how we
-/// can implement borrowing from an arbitrary type T using a raw
-/// pointer to const:
+/// MaybeOwnedTraits<T> 描述了如何从 T 进行借用。
+/// 下面演示了如何使用指向常量的原始指针从任意类型 T 实现借用
+/// MaybeOwnedTraitsGenericImpl抽象了【拥有】和【借用】这两个操作，类比 rust
 template <typename T>
 struct MaybeOwnedTraitsGenericImpl {
-  using owned_type = T;
-  using borrow_type = const T*;
+  using owned_type = T;     // 拥有类型就是 T 本身
+  using borrow_type = const T*;   // 借用类型就是指向常对象的指针
 
+  // 创建借用？直接取地址
   static borrow_type createBorrow(const owned_type& from) {
     return &from;
   }
 
+  // 借用赋值？就是指针赋值
   static void assignBorrow(borrow_type& lhs, borrow_type rhs) {
     lhs = rhs;
   }
 
+  // 销毁借用？对于裸指针，什么都不用做
   static void destroyBorrow(borrow_type& /*toDestroy*/) {}
 
+  // 从借用获取 const 引用？直接解引用
   static const owned_type& referenceFromBorrow(const borrow_type& borrow) {
     return *borrow;
   }
 
+  // 从借用获取指针？直接返回指针本身
   static const owned_type* pointerFromBorrow(const borrow_type& borrow) {
     return borrow;
   }
 
+  // 检查借用是否有效
   static bool debugBorrowIsValid(const borrow_type& borrow) {
     return borrow != nullptr;
   }
 };
 
-/// It is possible to eliminate the extra layer of indirection for
-/// borrows for some types that we control. For examples, see
-/// intrusive_ptr.h and TensorBody.h.
 
+// 【拥有】和【借用】特征类。
+// 只提供声明，不提供定义，这意味着如果你不提供特化版本就无法使用这个类
 template <typename T>
 struct MaybeOwnedTraits;
 
-// Explicitly enable MaybeOwned<shared_ptr<T>>, rather than allowing
-// MaybeOwned to be used for any type right away.
+// 显式特化 std::shared_ptr<T>
 template <typename T>
 struct MaybeOwnedTraits<std::shared_ptr<T>>
     : public MaybeOwnedTraitsGenericImpl<std::shared_ptr<T>> {};
 
-/// A smart pointer around either a borrowed or owned T. When
-/// constructed with borrowed(), the caller MUST ensure that the
-/// borrowed-from argument outlives this MaybeOwned<T>. Compare to
-/// Rust's std::borrow::Cow
-/// (https://doc.rust-lang.org/std/borrow/enum.Cow.html), but note
-/// that it is probably not suitable for general use because C++ has
-/// no borrow checking. Included here to support
-/// Tensor::expect_contiguous.
+/// 一个围绕借用或所有权的 T 的智能指针。当使用 borrowed() 构造时，
+/// 调用者必须确保被借用的参数的生命周期长于这个 MaybeOwned<T>。
+/// 与 Rust 的 std::borrow::Cow (https://doc.rust-lang.org/std/borrow/enum.Cow.html) 相比，
+/// 但请注意，由于 C++ 没有借用检查，它可能不适用于一般用途。
+/// 此处包含它是为了支持 Tensor::expect_contiguous。
 template <typename T>
 class MaybeOwned final {
   using borrow_type = typename MaybeOwnedTraits<T>::borrow_type;
@@ -72,15 +72,12 @@ class MaybeOwned final {
     owned_type own_;
   };
 
-  /// Don't use this; use borrowed() instead.
   explicit MaybeOwned(const owned_type& t)
       : isBorrowed_(true), borrow_(MaybeOwnedTraits<T>::createBorrow(t)) {}
 
-  /// Don't use this; use owned() instead.
   explicit MaybeOwned(T&& t) noexcept(std::is_nothrow_move_constructible_v<T>)
       : isBorrowed_(false), own_(std::move(t)) {}
 
-  /// Don't use this; use owned() instead.
   template <class... Args>
   explicit MaybeOwned(std::in_place_t /*unused*/, Args&&... args)
       : isBorrowed_(false), own_(std::forward<Args>(args)...) {}
@@ -88,10 +85,6 @@ class MaybeOwned final {
  public:
   explicit MaybeOwned() : isBorrowed_(true), borrow_() {}
 
-  // Copying a borrow yields another borrow of the original, as with a
-  // T*. Copying an owned T yields another owned T for safety: no
-  // chains of borrowing by default! (Note you could get that behavior
-  // with MaybeOwned<T>::borrowed(*rhs) if you wanted it.)
   MaybeOwned(const MaybeOwned& rhs) : isBorrowed_(rhs.isBorrowed_) {
     if (C10_LIKELY(rhs.isBorrowed_)) {
       MaybeOwnedTraits<T>::assignBorrow(borrow_, rhs.borrow_);
@@ -126,7 +119,6 @@ class MaybeOwned final {
   }
 
   MaybeOwned(MaybeOwned&& rhs) noexcept(
-      // NOLINTNEXTLINE(*-noexcept-move-*)
       std::is_nothrow_move_constructible_v<T> &&
       std::is_nothrow_move_assignable_v<borrow_type>)
       : isBorrowed_(rhs.isBorrowed_) {
@@ -141,7 +133,6 @@ class MaybeOwned final {
       std::is_nothrow_move_assignable_v<T> &&
       std::is_nothrow_move_assignable_v<borrow_type> &&
       std::is_nothrow_move_constructible_v<T> &&
-      // NOLINTNEXTLINE(*-noexcept-move-*)
       std::is_nothrow_destructible_v<T> &&
       std::is_nothrow_destructible_v<borrow_type>) {
     if (this == &rhs) {
@@ -182,7 +173,6 @@ class MaybeOwned final {
   }
 
   ~MaybeOwned() noexcept(
-      // NOLINTNEXTLINE(*-noexcept-destructor)
       std::is_nothrow_destructible_v<T> &&
       std::is_nothrow_destructible_v<borrow_type>) {
     if (C10_UNLIKELY(!isBorrowed_)) {
@@ -192,9 +182,6 @@ class MaybeOwned final {
     }
   }
 
-  // This is an implementation detail!  You should know what you're doing
-  // if you are testing this.  If you just want to guarantee ownership move
-  // this into a T
   bool unsafeIsBorrowed() const {
     return isBorrowed_;
   }
@@ -219,10 +206,6 @@ class MaybeOwned final {
         : &own_;
   }
 
-  // If borrowed, copy the underlying T. If owned, move from
-  // it. borrowed/owned state remains the same, and either we
-  // reference the same borrow as before or we are an owned moved-from
-  // T.
   T operator*() && {
     if (isBorrowed_) {
       TORCH_INTERNAL_ASSERT_DEBUG_ONLY(
